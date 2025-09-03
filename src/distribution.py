@@ -110,3 +110,113 @@ class NegativeBinomial(BaseDistribution):
         beta_var_df = pd.DataFrame(beta_var_T, index=self.feature_names, columns=beta_var_cols)
 
         return pd.concat([beta_df, beta_var_df], axis=1)
+
+
+class ZeroInflatedNegativeBinomial(BaseDistribution):
+    """
+    ZINB with:
+      log μ = X @ beta                  (beta: n_design × n_features)
+      r = exp(log_dispersion)           (per-feature)
+      π = sigmoid(X @ gamma)            (gamma: n_design × n_features), zero-inflation prob
+    """
+
+    def _initialize_parameters(self, X: pd.DataFrame, y: pd.DataFrame):
+        self.parameters['beta'] = torch.nn.Parameter(
+            torch.zeros(self.n_design, self.n_features)
+        )
+        self.parameters['log_dispersion'] = torch.nn.Parameter(
+            torch.zeros(self.n_features)
+        )
+        self.parameters['gamma'] = torch.nn.Parameter(
+            torch.zeros(self.n_design, self.n_features)
+        )
+
+    def log_likelihood(self, X: pd.DataFrame, y: pd.DataFrame) -> torch.Tensor:
+        beta   = self.parameters['beta']               # (p, f)
+        log_r  = self.parameters['log_dispersion']     # (f,)
+        gamma  = self.parameters['gamma']              # (p, f)
+
+        # Mean and NB part
+        log_mu      = self.X @ beta                    # (n, f)
+        nb_logits   = log_r - log_mu                   # (n, f)
+        r           = torch.exp(log_r)                 # (f,)
+        nb_dist     = torch.distributions.NegativeBinomial(total_count=r, logits=nb_logits)
+
+        # Zero-inflation prob
+        pi_logits   = self.X @ gamma                   # (n, f)
+        pi          = torch.sigmoid(pi_logits)
+
+        Y = self.y
+        log_nb_y    = nb_dist.log_prob(Y)              # (n, f)
+        log_nb_zero = nb_dist.log_prob(torch.zeros_like(Y))
+
+        eps = 1e-12
+        log1m_pi = torch.log1p(-pi.clamp_max(1 - eps))
+
+        zero_mask = (Y == 0)
+        ll_zero   = torch.logaddexp(torch.log(pi + eps), log1m_pi + log_nb_zero)
+        ll_non0   = log1m_pi + log_nb_y
+        ll = torch.where(zero_mask, ll_zero, ll_non0)
+
+        return ll.sum()
+
+    def _beta_variance_diag(self, damping: float = 1e-3) -> torch.Tensor:
+        """
+        Empirical Fisher diagonal for beta under ZINB.
+        """
+        with torch.enable_grad():
+            beta  = self.parameters['beta']
+            gamma = self.parameters['gamma']
+            log_r = self.parameters['log_dispersion']
+
+            fim_diag = torch.zeros_like(beta)
+
+            n = self.X.shape[0]
+            for i in range(n):
+                Xi = self.X[i:i+1, :]
+                yi = self.y[i:i+1, :]
+
+                log_mu_i  = Xi @ beta
+                nb_logits = log_r - log_mu_i
+                r = torch.exp(log_r)
+                nb_dist_i = torch.distributions.NegativeBinomial(total_count=r, logits=nb_logits)
+
+                pi_logits = Xi @ gamma
+                pi = torch.sigmoid(pi_logits)
+
+                log_nb_y  = nb_dist_i.log_prob(yi)
+                log_nb_0  = nb_dist_i.log_prob(torch.zeros_like(yi))
+
+                eps = 1e-12
+                log1m_pi  = torch.log1p(-pi.clamp_max(1 - eps))
+                zero_mask = (yi == 0)
+                ll_zero   = torch.logaddexp(torch.log(pi + eps), log1m_pi + log_nb_0)
+                ll_non0   = log1m_pi + log_nb_y
+                ll_i      = torch.where(zero_mask, ll_zero, ll_non0).sum()
+
+                nll_i = -ll_i
+                (g_beta,) = torch.autograd.grad(nll_i, (beta,), retain_graph=False)
+                fim_diag += g_beta**2
+
+            return 1.0 / (fim_diag + damping)
+
+    def export_parameters(self) -> pd.DataFrame:
+        # Compute beta variance first
+        beta_var = self._beta_variance_diag().detach().cpu().numpy()
+
+        with torch.no_grad():
+            beta = self.parameters['beta'].detach().cpu().numpy()
+            gamma = self.parameters['gamma'].detach().cpu().numpy()
+
+        # Transpose so rows = features, cols = designs
+        beta_T = beta.T
+        beta_var_T = beta_var.T
+        gamma_T = gamma.T
+
+        beta_df = pd.DataFrame(beta_T, index=self.feature_names, columns=self.design_names)
+        beta_var_df = pd.DataFrame(beta_var_T, index=self.feature_names,
+                                   columns=[f"{d} variance" for d in self.design_names])
+        gamma_df = pd.DataFrame(gamma_T, index=self.feature_names,
+                                columns=[f"{d} (ZI)" for d in self.design_names])
+
+        return pd.concat([beta_df, beta_var_df, gamma_df], axis=1)
